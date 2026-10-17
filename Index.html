@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract AuraDataMarketplace {
+    struct Dataset {
+        address payable provider;
+        uint256 accessPriceWei;
+        bool isActive;
+        bytes32 dataHash;
+    }
+
+    address payable public immutable marketAdmin;
+    string public marketDescriptor;
+    uint256 public platformFeeBps; // 250 = 2.5%
+    uint256 public datasetCounter;
+    uint256 public accumulatedFees;
+    bool public isMarketPaused;
+
+    mapping(address => bool) public approvedProviders;
+    mapping(uint256 => Dataset) public datasets;
+    mapping(uint256 => mapping(address => bool)) public hasAccess;
+
+    event ProviderAdded(address indexed provider);
+    event AccessPurchased(uint256 indexed datasetId, address indexed buyer, uint256 price);
+    event ListingCanceled(uint256 indexed datasetId);
+    event TreasuryDeposited(address indexed funder, uint256 amount);
+    event ReservesDrained(address indexed admin, uint256 amount);
+    event FeesHarvested(address indexed admin, uint256 amount);
+    event DatasetListed(uint256 indexed datasetId, address indexed provider, uint256 price);
+    event MarketPauseToggled(bool isPaused);
+    event ProviderRevoked(address indexed provider);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyAdmin() {
+        require(msg.sender == marketAdmin, "AuraMarket: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isMarketPaused, "AuraMarket: Market is paused");
+        _;
+    }
+
+    constructor() {
+        marketAdmin = payable(msg.sender);
+        marketDescriptor = "Aura Base Data Marketplace v1";
+        platformFeeBps = 250; // 2.5%
+        isMarketPaused = false;
+        approvedProviders[msg.sender] = true;
+    }
+
+    // 1. addApprovedProvider
+    function addApprovedProvider(address provider) external onlyAdmin {
+        require(!approvedProviders[provider], "AuraMarket: Already approved");
+        approvedProviders[provider] = true;
+        emit ProviderAdded(provider);
+    }
+
+    // 2. buyDatasetAccess
+    function buyDatasetAccess(uint256 datasetId) external payable whenNotPaused {
+        Dataset storage d = datasets[datasetId];
+        require(datasetId > 0 && datasetId <= datasetCounter, "AuraMarket: Invalid ID");
+        require(d.isActive, "AuraMarket: Not active");
+        require(!hasAccess[datasetId][msg.sender], "AuraMarket: Already purchased");
+        require(msg.value >= d.accessPriceWei, "AuraMarket: Insufficient payment");
+
+        uint256 fee = (msg.value * platformFeeBps) / 10000;
+        uint256 providerShare = msg.value - fee;
+
+        accumulatedFees += fee;
+        hasAccess[datasetId][msg.sender] = true;
+
+        if (providerShare > 0) {
+            (bool sent, ) = d.provider.call{value: providerShare}("");
+            require(sent, "AuraMarket: Provider payout failed");
+        }
+
+        emit AccessPurchased(datasetId, msg.sender, msg.value);
+    }
+
+    // 3. cancelDatasetListing
+    function cancelDatasetListing(uint256 datasetId) external {
+        Dataset storage d = datasets[datasetId];
+        require(datasetId > 0 && datasetId <= datasetCounter, "AuraMarket: Invalid ID");
+        require(msg.sender == d.provider || msg.sender == marketAdmin, "AuraMarket: Unauthorized");
+        require(d.isActive, "AuraMarket: Already inactive");
+
+        d.isActive = false;
+        emit ListingCanceled(datasetId);
+    }
+
+    // 4. depositPlatformTreasury
+    function depositPlatformTreasury() external payable whenNotPaused {
+        require(msg.value > 0, "AuraMarket: Zero deposit");
+        accumulatedFees += msg.value;
+        emit TreasuryDeposited(msg.sender, msg.value);
+    }
+
+    // 5. drainMarketReserves
+    function drainMarketReserves() external onlyAdmin {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "AuraMarket: Zero balance");
+
+        accumulatedFees = 0;
+        (bool sent, ) = marketAdmin.call{value: balance}("");
+        require(sent, "AuraMarket: Sweep failed");
+
+        emit ReservesDrained(marketAdmin, balance);
+    }
+
+    // 6. harvestPlatformFees
+    function harvestPlatformFees() external onlyAdmin {
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "AuraMarket: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = marketAdmin.call{value: amount}("");
+        require(sent, "AuraMarket: Harvest failed");
+
+        emit FeesHarvested(marketAdmin, amount);
+    }
+
+    // 7. listNewDataset
+    function listNewDataset(uint256 priceWei, bytes32 dataHash) external whenNotPaused returns (uint256) {
+        require(approvedProviders[msg.sender], "AuraMarket: Not approved");
+        require(priceWei > 0, "AuraMarket: Zero price not allowed");
+
+        datasetCounter++;
+        datasets[datasetCounter] = Dataset({
+            provider: payable(msg.sender),
+            accessPriceWei: priceWei,
+            isActive: true,
+            dataHash: dataHash
+        });
+
+        emit DatasetListed(datasetCounter, msg.sender, priceWei);
+        return datasetCounter;
+    }
+
+    // 8. pauseDataMarket
+    function pauseDataMarket(bool isPaused) external onlyAdmin {
+        isMarketPaused = isPaused;
+        emit MarketPauseToggled(isPaused);
+    }
+
+    // 9. revokeProviderAccess
+    function revokeProviderAccess(address provider) external onlyAdmin {
+        require(approvedProviders[provider], "AuraMarket: Not a provider");
+        require(provider != msg.sender, "AuraMarket: Cannot revoke self");
+        approvedProviders[provider] = false;
+        emit ProviderRevoked(provider);
+    }
+
+    // 10. updateMarketDescriptor
+    function updateMarketDescriptor(string calldata newDescriptor) external onlyAdmin {
+        require(bytes(newDescriptor).length > 0, "AuraMarket: Empty string");
+        marketDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getDatasetInfo(uint256 datasetId) external view returns (
+        address provider,
+        uint256 price,
+        bool isActive,
+        bytes32 dataHash
+    ) {
+        Dataset memory d = datasets[datasetId];
+        return (d.provider, d.accessPriceWei, d.isActive, d.dataHash);
+    }
+}
